@@ -1,0 +1,541 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Mic, MicOff, Settings, Info, Music, ArrowLeft, Activity, Globe, Zap, Mic2, Check, Crown, X } from 'lucide-react';
+
+const Tuner = () => {
+  // --- CONFIGURATION ZONE ---
+  // 1. Go to Stripe Dashboard -> Payment Links -> Create New
+  // 2. Set the "After payment" behavior to "Redirect to your site"
+  // 3. Add "?payment=success" to the end of your URL (e.g. https://your-site.com/?payment=success)
+  // 4. Paste the stripe link below:
+  const STRIPE_LINK = "https://buy.stripe.com/test_12345"; 
+  
+  // --------------------------
+
+  const [isListening, setIsListening] = useState(false);
+  const [note, setNote] = useState('-');
+  const [cents, setCents] = useState(0);
+  const [frequency, setFrequency] = useState(0);
+  const [status, setStatus] = useState('Tap Mic to Start');
+  const [nearestString, setNearestString] = useState(null);
+  
+  // Screen States
+  const [showInfo, setShowInfo] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showSubscription, setShowSubscription] = useState(false);
+  
+  // Data Persistence
+  const [currentTuning, setCurrentTuning] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('truePitchTuning') || 'Standard';
+    }
+    return 'Standard';
+  });
+
+  const [isPro, setIsPro] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('truePitchPro') === 'true';
+    }
+    return false;
+  });
+
+  // --- PAYMENT SUCCESS CHECKER ---
+  useEffect(() => {
+    // This checks if the user just came back from Stripe with a success flag
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('payment') === 'success') {
+        setIsPro(true);
+        localStorage.setItem('truePitchPro', 'true');
+        // Clean the URL so they don't refresh and re-trigger
+        window.history.replaceState({}, document.title, window.location.pathname);
+        alert("Payment Successful! Welcome to Pro.");
+      }
+    }
+  }, []);
+
+  const audioContextRef = useRef(null);
+  const analyserRef = useRef(null);
+  const sourceRef = useRef(null);
+  const rafIdRef = useRef(null);
+
+  // A4 reference frequency (Fixed at 432Hz)
+  const A4 = 432;
+  const NOTE_STRINGS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+  
+  // Tuning Definitions
+  const TUNINGS = {
+    'Standard':       [ {n:'E',o:2}, {n:'A',o:2}, {n:'D',o:3}, {n:'G',o:3}, {n:'B',o:3}, {n:'E',o:4} ],
+    'Half Step Down': [ {n:'D#',o:2}, {n:'G#',o:2}, {n:'C#',o:3}, {n:'F#',o:3}, {n:'A#',o:3}, {n:'D#',o:4} ],
+    'Full Step Down': [ {n:'D',o:2}, {n:'G',o:2}, {n:'C',o:3}, {n:'F',o:3}, {n:'A',o:3}, {n:'D',o:4} ],
+    'Drop D':         [ {n:'D',o:2}, {n:'A',o:2}, {n:'D',o:3}, {n:'G',o:3}, {n:'B',o:3}, {n:'E',o:4} ],
+    'Double Drop D':  [ {n:'D',o:2}, {n:'A',o:2}, {n:'D',o:3}, {n:'G',o:3}, {n:'B',o:3}, {n:'D',o:4} ],
+    'DADGAD':         [ {n:'D',o:2}, {n:'A',o:2}, {n:'D',o:3}, {n:'G',o:3}, {n:'A',o:3}, {n:'D',o:4} ],
+    'Open G':         [ {n:'D',o:2}, {n:'G',o:2}, {n:'D',o:3}, {n:'G',o:3}, {n:'B',o:3}, {n:'D',o:4} ],
+  };
+
+  // Save to localStorage whenever specific states change
+  useEffect(() => {
+    localStorage.setItem('truePitchTuning', currentTuning);
+  }, [currentTuning]);
+
+  useEffect(() => {
+    localStorage.setItem('truePitchPro', isPro);
+  }, [isPro]);
+
+  const handleSubscribe = () => {
+    // Redirects user to the Stripe Payment Link
+    if (STRIPE_LINK && STRIPE_LINK.startsWith('http')) {
+        window.location.href = STRIPE_LINK;
+    } else {
+        alert("Stripe Link not configured yet! Check code line 18.");
+    }
+  };
+
+  const restorePurchase = () => {
+      // Simple mechanism to restore (in a real app, you'd verify with a database)
+      // For now, we'll just check if they are already Pro in local storage
+      if (localStorage.getItem('truePitchPro') === 'true') {
+          setIsPro(true);
+          alert("Pro status restored.");
+      } else {
+          alert("No previous purchase found on this device.");
+      }
+  };
+
+  // Helper to get frequency for a note relative to A4=432Hz
+  const getFrequency = (noteName, octave) => {
+    const keyNumber = NOTE_STRINGS.indexOf(noteName);
+    if (keyNumber === -1) return 0;
+    const midiNum = (octave + 1) * 12 + keyNumber;
+    return A4 * Math.pow(2, (midiNum - 69) / 12);
+  };
+
+  // Generate current target strings
+  const activeStrings = TUNINGS[currentTuning].map(s => ({
+    note: s.n,
+    octave: s.o,
+    freq: getFrequency(s.n, s.o)
+  }));
+
+  const autoCorrelate = (buffer, sampleRate) => {
+    let SIZE = buffer.length;
+    let sumOfSquares = 0;
+    
+    for (let i = 0; i < SIZE; i++) {
+      let val = buffer[i];
+      sumOfSquares += val * val;
+    }
+    let rootMeanSquare = Math.sqrt(sumOfSquares / SIZE);
+
+    if (rootMeanSquare < 0.01) return -1;
+
+    let r1 = 0; 
+    let r2 = SIZE - 1;
+    let thres = 0.2;
+    
+    for (let i = 0; i < SIZE / 2; i++) {
+      if (Math.abs(buffer[i]) < thres) { r1 = i; break; }
+    }
+    for (let i = 1; i < SIZE / 2; i++) {
+      if (Math.abs(buffer[SIZE - i]) < thres) { r2 = SIZE - i; break; }
+    }
+
+    buffer = buffer.slice(r1, r2);
+    SIZE = buffer.length;
+
+    let c = new Array(SIZE).fill(0);
+    for (let i = 0; i < SIZE; i++) {
+      for (let j = 0; j < SIZE - i; j++) {
+        c[i] = c[i] + buffer[j] * buffer[j + i];
+      }
+    }
+
+    let d = 0; 
+    while (c[d] > c[d + 1]) d++;
+    let maxval = -1, maxpos = -1;
+    
+    for (let i = d; i < SIZE; i++) {
+      if (c[i] > maxval) {
+        maxval = c[i];
+        maxpos = i;
+      }
+    }
+    
+    let T0 = maxpos;
+    let x1 = c[T0 - 1], x2 = c[T0], x3 = c[T0 + 1];
+    let a = (x1 + x3 - 2 * x2) / 2;
+    let b = (x3 - x1) / 2;
+    if (a) T0 = T0 - b / (2 * a);
+
+    return sampleRate / T0;
+  };
+
+  const getNote = (freq) => {
+    const noteNum = 12 * (Math.log(freq / A4) / Math.log(2)) + 69;
+    return Math.round(noteNum);
+  };
+
+  const getCents = (freq, noteNum) => {
+    const frequencyFromNoteNumber = A4 * Math.pow(2, (noteNum - 69) / 12);
+    return Math.floor(1200 * Math.log2(freq / frequencyFromNoteNumber));
+  };
+
+  const updatePitch = useCallback(() => {
+    if (!analyserRef.current) return;
+    
+    const buffer = new Float32Array(analyserRef.current.fftSize);
+    analyserRef.current.getFloatTimeDomainData(buffer);
+    
+    const ac = autoCorrelate(buffer, audioContextRef.current.sampleRate);
+    
+    if (ac !== -1) {
+      const pitch = ac;
+      const noteNum = getNote(pitch);
+      const noteName = NOTE_STRINGS[noteNum % 12];
+      const octave = Math.floor(noteNum / 12) - 1;
+      const detune = getCents(pitch, noteNum);
+      
+      setFrequency(pitch);
+      setNote(`${noteName}${octave}`);
+      setCents(detune);
+      setStatus('TUNING...');
+
+      const closestString = activeStrings.reduce((prev, curr) => {
+        return (Math.abs(curr.freq - pitch) < Math.abs(prev.freq - pitch) ? curr : prev);
+      });
+
+      if (Math.abs(closestString.freq - pitch) < 10) { 
+          setNearestString(closestString.note + closestString.octave);
+      } else {
+          setNearestString(null);
+      }
+    }
+    
+    rafIdRef.current = requestAnimationFrame(updatePitch);
+  }, [activeStrings]);
+
+  const startListening = async () => {
+    try {
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      sourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
+      analyserRef.current = audioContextRef.current.createAnalyser();
+      analyserRef.current.fftSize = 2048;
+      sourceRef.current.connect(analyserRef.current);
+      setIsListening(true);
+      setStatus('LISTENING...');
+      updatePitch();
+    } catch (err) {
+      console.error(err);
+      setStatus('MIC ERROR');
+    }
+  };
+
+  const stopListening = () => {
+    if (sourceRef.current) sourceRef.current.disconnect();
+    if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+    setIsListening(false);
+    setStatus('TAP MIC TO START');
+    setFrequency(0);
+    setNote('-');
+    setCents(0);
+    setNearestString(null);
+  };
+
+  const toggleTuner = () => {
+    if (isListening) stopListening();
+    else startListening();
+  };
+
+  useEffect(() => {
+    if (isListening) {
+      if (rafIdRef.current) cancelAnimationFrame(rafIdRef.current);
+      updatePitch();
+    }
+  }, [activeStrings, updatePitch]);
+
+  useEffect(() => {
+    return () => {
+      stopListening();
+      if (audioContextRef.current) audioContextRef.current.close();
+    };
+  }, []);
+
+  // Visuals
+  const needleRotation = Math.min(Math.max(cents, -50), 50) * 1.8; 
+  const isCentsInTune = Math.abs(cents) < 5;
+  const noteColor = isListening && frequency > 0 
+    ? (isCentsInTune ? 'text-lime-400 drop-shadow-[0_0_15px_rgba(163,230,53,0.9)]' : 'text-fuchsia-400 drop-shadow-[0_0_15px_rgba(232,121,249,0.9)]') 
+    : 'text-slate-700';
+  const needleColor = isCentsInTune ? 'stroke-lime-400 drop-shadow-[0_0_8px_#a3e635]' : 'stroke-fuchsia-500 drop-shadow-[0_0_8px_#d946ef]';
+  const needleKnobColor = isCentsInTune ? 'fill-lime-400' : 'fill-fuchsia-500';
+
+  // --- SUBSCRIPTION SCREEN ---
+  if (showSubscription) {
+    return (
+      <div className="min-h-screen bg-black text-white font-sans selection:bg-amber-500 selection:text-black flex flex-col items-center justify-center p-6 relative overflow-hidden">
+        
+        {/* Ambient Gold Background */}
+        <div className="absolute inset-0 bg-gradient-to-br from-amber-900/20 via-black to-slate-950 z-0 pointer-events-none"></div>
+        <div className="absolute top-0 w-full h-full opacity-30 bg-[radial-gradient(circle_at_50%_50%,rgba(251,191,36,0.15),transparent_70%)] pointer-events-none"></div>
+
+        <div className="max-w-md w-full relative z-10 bg-slate-900/80 backdrop-blur-xl border border-amber-500/30 p-8 rounded-2xl shadow-[0_0_50px_rgba(245,158,11,0.2)]">
+            <button 
+              onClick={() => setShowSubscription(false)}
+              className="absolute top-4 right-4 text-slate-500 hover:text-white transition-colors"
+            >
+              <X size={24} />
+            </button>
+
+            <div className="flex flex-col items-center text-center">
+              <div className="w-16 h-16 bg-amber-500/10 rounded-full flex items-center justify-center mb-6 ring-1 ring-amber-500/50 shadow-[0_0_20px_rgba(245,158,11,0.4)]">
+                <Crown size={32} className="text-amber-400" />
+              </div>
+              
+              <h2 className="text-2xl font-bold text-white mb-2">Upgrade to Pro</h2>
+              <p className="text-slate-400 mb-8 text-sm leading-relaxed">
+                Support the developer and remove all advertisements for a purely immersive experience.
+              </p>
+
+              <div className="space-y-4 w-full">
+                <div className="flex items-center gap-3 p-3 bg-white/5 rounded-lg border border-white/10">
+                  <div className="bg-green-500/20 p-1 rounded-full"><Check size={14} className="text-green-400"/></div>
+                  <span className="text-sm text-slate-300">Ad-Free Experience</span>
+                </div>
+                <div className="flex items-center gap-3 p-3 bg-white/5 rounded-lg border border-white/10">
+                  <div className="bg-green-500/20 p-1 rounded-full"><Check size={14} className="text-green-400"/></div>
+                  <span className="text-sm text-slate-300">Support Future Updates</span>
+                </div>
+              </div>
+
+              <div className="mt-8 w-full space-y-3">
+                <button 
+                  onClick={handleSubscribe}
+                  className="w-full py-4 bg-gradient-to-r from-amber-500 to-orange-500 text-black font-bold text-lg rounded-xl hover:shadow-[0_0_30px_rgba(245,158,11,0.6)] transition-all transform active:scale-95"
+                >
+                  Subscribe for $5.00/mo
+                </button>
+                <button 
+                  onClick={restorePurchase} 
+                  className="text-xs text-slate-500 hover:text-amber-400 transition-colors"
+                >
+                  Restore Purchase
+                </button>
+              </div>
+            </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- SETTINGS SCREEN ---
+  if (showSettings) {
+    return (
+       <div className="min-h-screen bg-black text-white font-sans selection:bg-fuchsia-500 selection:text-white flex flex-col items-center p-6 overflow-y-auto">
+        <div className="max-w-md w-full relative">
+            <button onClick={() => setShowSettings(false)} className="absolute top-0 left-0 p-2 text-cyan-400 hover:text-white transition-colors"><ArrowLeft size={24} /></button>
+            <div className="mt-12 mb-8">
+              <h1 className="text-3xl font-black italic tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-fuchsia-400 drop-shadow-[0_0_5px_rgba(34,211,238,0.5)] mb-2">TUNING</h1>
+              <p className="text-slate-400 text-sm font-mono border-l-2 border-fuchsia-500 pl-4">Select your setup. All calibrated to A4=432Hz.</p>
+            </div>
+            <div className="space-y-4 pb-12">
+               {Object.keys(TUNINGS).map((tuningName) => (
+                 <button
+                   key={tuningName}
+                   onClick={() => { setCurrentTuning(tuningName); setShowSettings(false); }}
+                   className={`w-full p-4 rounded-xl border flex justify-between items-center transition-all group ${currentTuning === tuningName ? 'bg-cyan-900/20 border-cyan-500/50 shadow-[0_0_20px_rgba(34,211,238,0.2)]' : 'bg-slate-900/50 border-slate-800 hover:border-cyan-500/30'}`}
+                 >
+                   <div className="text-left">
+                     <span className={`block font-bold text-lg ${currentTuning === tuningName ? 'text-cyan-400' : 'text-slate-300 group-hover:text-cyan-200'}`}>{tuningName}</span>
+                     <span className="text-xs font-mono text-slate-500 tracking-wider">{TUNINGS[tuningName].map(s => s.n).join(' ')}</span>
+                   </div>
+                   {currentTuning === tuningName && <Check className="text-cyan-400 drop-shadow-[0_0_5px_rgba(34,211,238,0.8)]" />}
+                 </button>
+               ))}
+            </div>
+        </div>
+      </div>
+    )
+  }
+
+  // --- INFO SCREEN ---
+  if (showInfo) {
+    return (
+      <div className="min-h-screen bg-black text-white font-sans selection:bg-fuchsia-500 selection:text-white flex flex-col items-center p-6 overflow-y-auto">
+        <div className="max-w-md w-full relative">
+            <button onClick={() => setShowInfo(false)} className="absolute top-0 left-0 p-2 text-cyan-400 hover:text-white transition-colors"><ArrowLeft size={24} /></button>
+            <div className="mt-12 mb-8">
+              <h1 className="text-3xl font-black italic tracking-wider text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-fuchsia-400 drop-shadow-[0_0_5px_rgba(34,211,238,0.5)] mb-2">WHY 432<span className="text-fuchsia-400">Hz</span>?</h1>
+              <p className="text-slate-400 text-sm font-mono border-l-2 border-fuchsia-500 pl-4">The frequency of the universe, nature, and healing.</p>
+            </div>
+            <div className="space-y-8 pb-12">
+              <div className="bg-slate-900/50 p-6 rounded-xl border border-cyan-900/50 backdrop-blur-sm relative overflow-hidden group hover:border-cyan-500/30 transition-colors">
+                <div className="absolute top-0 right-0 p-4 opacity-20 group-hover:opacity-40 transition-opacity"><Globe className="text-cyan-400" size={48} /></div>
+                <h2 className="text-xl font-bold text-cyan-300 mb-3 flex items-center gap-2"><span className="w-1 h-6 bg-cyan-500 block"></span>The Pythagorean Tuning</h2>
+                <p className="text-slate-300 text-sm leading-relaxed">In ancient Greece, Pythagoras—the father of music and mathematics—tuned his instruments using 432Hz. This pitch is mathematically consistent with the rotation of the Earth and the Golden Ratio (Phi).</p>
+              </div>
+              <div className="bg-slate-900/50 p-6 rounded-xl border border-fuchsia-900/50 backdrop-blur-sm relative overflow-hidden group hover:border-fuchsia-500/30 transition-colors">
+                 <div className="absolute top-0 right-0 p-4 opacity-20 group-hover:opacity-40 transition-opacity"><Activity className="text-fuchsia-400" size={48} /></div>
+                 <h2 className="text-xl font-bold text-fuchsia-300 mb-3 flex items-center gap-2"><span className="w-1 h-6 bg-fuchsia-500 block"></span>Nature's Resonance</h2>
+                 <p className="text-slate-300 text-sm leading-relaxed">432Hz is said to vibrate in harmony with the universe's golden mean (Phi). It is mathematically linked to the frequency of the sun, the orbit of planets, and the vibrations of DNA.</p>
+              </div>
+              <div className="bg-slate-900/50 p-6 rounded-xl border border-lime-900/50 backdrop-blur-sm relative overflow-hidden group hover:border-lime-500/30 transition-colors">
+                 <div className="absolute top-0 right-0 p-4 opacity-20 group-hover:opacity-40 transition-opacity"><Zap className="text-lime-400" size={48} /></div>
+                 <h2 className="text-xl font-bold text-lime-300 mb-3 flex items-center gap-2"><span className="w-1 h-6 bg-lime-500 block"></span>Healing & Vibes</h2>
+                 <p className="text-slate-300 text-sm leading-relaxed">Sound healing practitioners believe 440Hz stimulates the brain in an aggressive way. Conversely, 432Hz resonates with the heart chakra and the water inside our bodies.</p>
+              </div>
+              <div className="bg-slate-900/50 p-6 rounded-xl border border-amber-900/50 backdrop-blur-sm relative overflow-hidden group hover:border-amber-500/30 transition-colors">
+                 <div className="absolute top-0 right-0 p-4 opacity-20 group-hover:opacity-40 transition-opacity"><Mic2 className="text-amber-400" size={48} /></div>
+                 <h2 className="text-xl font-bold text-amber-300 mb-3 flex items-center gap-2"><span className="w-1 h-6 bg-amber-500 block"></span>For Singers</h2>
+                 <p className="text-slate-300 text-sm leading-relaxed">For vocalists, the slightly lower pitch of 432Hz can result in less strain on the vocal cords. By tuning your guitar strings (E, A, D, G, B, E) to the 432Hz scale, your voice naturally aligns with this frequency.</p>
+              </div>
+            </div>
+        </div>
+      </div>
+    );
+  }
+
+  // --- MAIN TUNER UI ---
+  return (
+    <div className="min-h-screen bg-black text-white font-sans selection:bg-fuchsia-500 selection:text-white">
+      <div className="max-w-md mx-auto min-h-screen flex flex-col relative bg-slate-950 border-x border-slate-900 shadow-2xl">
+        
+        {/* Header */}
+        <div className="p-6 flex justify-between items-center bg-slate-950/90 border-b border-cyan-900/30 z-20">
+          <div className="flex gap-4">
+             <button onClick={() => setShowSettings(true)} className="p-2 text-slate-500 hover:text-cyan-400 rounded-full transition-all hover:bg-slate-900" aria-label="Tuning Settings"><Settings size={24} /></button>
+             {/* Crown Icon (Only visible if NOT Pro, or Gold if Pro) */}
+             {!isPro ? (
+               <button onClick={() => setShowSubscription(true)} className="p-2 text-slate-500 hover:text-amber-400 rounded-full transition-all hover:bg-slate-900" aria-label="Upgrade to Pro"><Crown size={24} /></button>
+             ) : (
+               <div className="p-2 text-amber-500/50 cursor-default" aria-label="Pro User"><Crown size={24} /></div>
+             )}
+          </div>
+
+          <div className="flex flex-col items-center">
+            <div className="flex items-center gap-2 mb-1">
+              <Music size={16} className="text-cyan-400 drop-shadow-[0_0_10px_rgba(34,211,238,0.8)]" />
+              <h1 className="text-lg font-black italic tracking-widest text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-fuchsia-400 drop-shadow-[0_0_5px_rgba(34,211,238,0.5)]">TRUE PITCH</h1>
+            </div>
+            <div className="text-[10px] font-bold text-cyan-500 tracking-[0.2em] drop-shadow-[0_0_2px_rgba(34,211,238,0.5)]">GUITAR TUNER 432<span className="text-fuchsia-400">HZ</span></div>
+            <div className="text-[9px] font-mono text-slate-600 tracking-widest mt-1">{currentTuning.toUpperCase()}</div>
+          </div>
+
+          <button onClick={() => setShowInfo(true)} className="p-2 text-slate-500 hover:text-white hover:bg-slate-900 rounded-full transition-all" aria-label="Info about 432Hz"><Info size={24} /></button>
+        </div>
+
+        {/* Main Display Area */}
+        <div className="flex-1 flex flex-col items-center justify-center p-6 relative overflow-hidden">
+          
+          {/* Cyberpunk Grid Background */}
+          <div className="absolute inset-0 opacity-20 pointer-events-none" style={{backgroundImage: 'linear-gradient(rgba(34, 211, 238, 0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(34, 211, 238, 0.3) 1px, transparent 1px)', backgroundSize: '40px 40px', perspective: '500px'}}></div>
+          <div className="absolute inset-0 bg-gradient-to-t from-black via-slate-950/80 to-slate-950/50 pointer-events-none"></div>
+
+          {/* String Indicators */}
+          <div className="w-full flex justify-between mb-12 px-2 relative z-10">
+            {activeStrings.map((s, idx) => (
+              <div 
+                key={idx}
+                className={`w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold transition-all duration-300 border-2
+                  ${nearestString === (s.note + s.octave) && isListening 
+                    ? (isCentsInTune 
+                        ? 'bg-lime-500 border-lime-400 text-black scale-125 shadow-[0_0_30px_rgba(132,204,22,1)]' 
+                        : 'bg-cyan-500 border-cyan-400 text-black scale-125 shadow-[0_0_30px_rgba(34,211,238,1)]') 
+                    : 'bg-slate-900 border-cyan-900/50 text-cyan-700 shadow-[0_0_10px_rgba(34,211,238,0.1)]'
+                  }`}
+              >
+                {s.note}
+              </div>
+            ))}
+          </div>
+
+          {/* Tuner Gauge */}
+          <div className="relative w-72 h-44 mb-2 z-10">
+            <svg viewBox="0 0 200 120" className="w-full h-full overflow-visible">
+              <path d="M20,100 A 80 80 0 0 1 180,100" fill="none" stroke="#1e293b" strokeWidth="4" />
+              <path d="M20,100 A 80 80 0 0 1 180,100" fill="none" stroke="#22d3ee" strokeWidth="1" className="opacity-50 drop-shadow-[0_0_5px_#22d3ee]" strokeDasharray="4 4" />
+              <line x1="20" y1="100" x2="20" y2="90" stroke="#22d3ee" strokeWidth="2" className="drop-shadow-[0_0_5px_#22d3ee]" />
+              <line x1="60" y1="73" x2="64" y2="80" stroke="#22d3ee" strokeWidth="2" className="drop-shadow-[0_0_5px_#22d3ee]" />
+              <line x1="100" y1="60" x2="100" y2="70" stroke="#facc15" strokeWidth="3" className="drop-shadow-[0_0_8px_#facc15]" />
+              <line x1="140" y1="73" x2="136" y2="80" stroke="#22d3ee" strokeWidth="2" className="drop-shadow-[0_0_5px_#22d3ee]" />
+              <line x1="180" y1="100" x2="180" y2="90" stroke="#22d3ee" strokeWidth="2" className="drop-shadow-[0_0_5px_#22d3ee]" />
+              <g style={{ transformOrigin: '100px 100px', transform: `rotate(${needleRotation}deg)`, transition: 'transform 200ms ease-out' }}>
+                <line x1="100" y1="100" x2="100" y2="25" className={isListening && frequency > 0 ? needleColor : 'stroke-slate-800'} strokeWidth="4" strokeLinecap="round" />
+                <circle cx="100" cy="100" r="6" className={isListening && frequency > 0 ? needleKnobColor : 'fill-slate-800'} />
+              </g>
+              <text x="15" y="115" fontSize="10" className="fill-violet-400 font-mono font-bold drop-shadow-[0_0_3px_#a78bfa]">-50</text>
+              <text x="185" y="115" fontSize="10" className="fill-violet-400 text-right font-mono font-bold drop-shadow-[0_0_3px_#a78bfa]" textAnchor="end">+50</text>
+              <text x="100" y="50" fontSize="10" className="fill-amber-400 font-mono font-bold drop-shadow-[0_0_5px_#fbbf24]" textAnchor="middle">0</text>
+            </svg>
+          </div>
+
+          {/* Note Display */}
+          <div className="text-center z-10 relative">
+            <div className={`text-9xl font-black transition-all duration-200 tracking-tighter ${noteColor}`} style={{fontFamily: 'Arial, sans-serif'}}>
+              {note.replace(/[0-9]/g, '')}
+              <span className="text-4xl absolute top-4 -right-8 opacity-80 font-mono font-bold text-cyan-300 drop-shadow-[0_0_5px_#22d3ee]">{note.match(/[0-9]/g)}</span>
+            </div>
+            <div className="mt-2 h-8">
+              <span className={`text-xl font-mono font-bold tracking-[0.2em] ${isListening && frequency > 0 ? 'text-amber-300 drop-shadow-[0_0_8px_rgba(251,191,36,0.8)]' : 'text-slate-800'}`}>
+                {isListening && frequency > 0 ? `${frequency.toFixed(1)}` : '---.-'} 
+              </span>
+              <span className="text-xs text-amber-700 font-bold ml-2">HZ</span>
+            </div>
+            <div className={`mt-2 font-black text-sm h-6 uppercase tracking-widest bg-slate-900/50 px-4 py-1 rounded-full border ${isCentsInTune ? 'border-lime-500/50 text-lime-400 shadow-[0_0_15px_rgba(163,230,53,0.3)]' : 'border-slate-800 text-slate-600'}`}>
+              {isListening && frequency > 0 ? (cents === 0 ? 'PERFECT' : `${cents > 0 ? '+' : ''}${cents} CENTS`) : 'STANDBY'}
+            </div>
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div className="px-10 pt-10 pb-4 bg-gradient-to-t from-violet-950/20 to-transparent flex flex-col items-center z-20">
+          <button 
+            onClick={toggleTuner}
+            className={`
+              w-24 h-24 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 transform active:scale-95 border-[3px]
+              ${isListening 
+                ? 'bg-purple-900/20 border-purple-500 text-purple-400 hover:bg-purple-900/40 hover:border-purple-400 animate-pulse shadow-[0_0_40px_rgba(168,85,247,0.5)]' 
+                : 'bg-slate-900 border-slate-700 text-slate-500 hover:border-cyan-500 hover:text-cyan-500 hover:shadow-[0_0_20px_rgba(34,211,238,0.3)]'
+              }
+            `}
+          >
+            {isListening ? <MicOff size={36} className="drop-shadow-[0_0_10px_currentColor]" /> : <Mic size={36} />}
+          </button>
+          <p className="mt-4 text-cyan-600/70 text-[10px] font-mono font-bold uppercase tracking-[0.3em] drop-shadow-[0_0_2px_rgba(8,145,178,0.5)]">{status}</p>
+        </div>
+
+        {/* --- ADVERTISEMENT BANNER --- */}
+        {/* Only show if user is NOT Pro */}
+        {!isPro && (
+          <div className="w-full h-[60px] bg-slate-900 border-t border-slate-800 flex items-center justify-center relative overflow-hidden">
+             
+             {/* --- AD CODE GOES HERE --- 
+                 If you use Google AdSense, paste the <ins> tag here.
+                 You might need to use a dangerousSetInnerHTML or just standard React syntax.
+                 For now, we keep the placeholder.
+             */}
+
+             <div className="absolute inset-0 opacity-10 bg-[url('https://www.transparenttextures.com/patterns/diagonal-stripes.png')] pointer-events-none"></div>
+             <div className="z-10 text-center pointer-events-none">
+                <p className="text-[10px] text-slate-500 font-mono tracking-widest">ADVERTISEMENT</p>
+                <p className="text-xs text-slate-300 font-bold">Paste Ad Code in Line 482</p>
+             </div>
+             
+             {/* 'Remove Ads' CTA Overlay */}
+             <button 
+               onClick={() => setShowSubscription(true)}
+               className="absolute right-2 top-1/2 -translate-y-1/2 bg-amber-500/20 hover:bg-amber-500/40 border border-amber-500/50 text-amber-500 text-[9px] px-2 py-1 rounded uppercase font-bold tracking-wider transition-colors z-20"
+             >
+               Remove Ads
+             </button>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+};
+
+export default Tuner;
